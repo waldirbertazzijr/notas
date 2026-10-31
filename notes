@@ -1,0 +1,279 @@
+#!/usr/bin/env -S uv run --quiet --script
+# /// script
+# requires-python = ">=3.10"
+# dependencies = ["numpy"]
+# ///
+"""Tiny piano synth: play note strings or render .mid files.
+
+  notes "E5 G5 C6:2 A5 F5 A5:2 G5 B5 D6 B5 C6:3"          play a melody
+  notes "E5 G5 C6:2" "C3+E3+G3:4"                          extra args = extra voices
+  notes -b 0.25 "C4 D4 E4 - E4"                            beat length in seconds, '-' = rest
+  notes --midi song.mid -o song.wav                        render a MIDI file
+"""
+import argparse, os, re, shutil, struct, subprocess, sys, tempfile, wave
+import numpy as np
+
+RATE = 48000
+NAMES = {'C': 0, 'D': 2, 'E': 4, 'F': 5, 'G': 7, 'A': 9, 'B': 11}
+
+
+def midi_freq(n):
+    return 440 * 2 ** ((n - 69) / 12)
+
+
+def note_number(name):
+    """'C#4' / 'Bb3' / 'c5' -> MIDI note number (C4 = 60)."""
+    m = re.fullmatch(r'([A-Ga-g])([#b]?)(-?\d)', name)
+    if not m:
+        sys.exit(f'bad note: {name!r}')
+    letter, acc, octave = m.groups()
+    return NAMES[letter.upper()] + {'#': 1, 'b': -1, '': 0}[acc] + (int(octave) + 1) * 12
+
+
+# --- the "instrument" ----------------------------------------------------------
+
+def piano(note, velocity, held):
+    """Render one piano-ish note: decaying harmonics, brighter when struck harder."""
+    f = midi_freq(note)
+    release = 0.25
+    length = min(held, 6.0) + release
+    t = np.arange(int(length * RATE)) / RATE
+    v = velocity / 127
+    out = np.zeros_like(t)
+    for k in range(1, 9):
+        if f * k > RATE / 2.2:                       # skip partials above hearing/Nyquist
+            break
+        amp = v ** (1 + k * 0.15) / k ** 1.3         # harder hit = more upper partials
+        decay = (0.6 + 0.35 * k) * (f / 261) ** 0.5  # high partials & high notes die faster
+        detune = 1 + 0.0004 * k                      # two slightly mistuned strings -> shimmer
+        out += amp * np.exp(-decay * t) * (np.sin(2 * np.pi * f * k * t)
+                                           + np.sin(2 * np.pi * f * k * detune * t)) / 2
+    attack = np.minimum(1, t / 0.004)                # 4 ms hammer strike
+    fade = np.clip((length - t) / release, 0, 1)     # damper falls after key release
+    return out * attack * fade * v
+
+
+def render(events):
+    """events: list of (start_seconds, midi_note, velocity, held_seconds)."""
+    if not events:
+        sys.exit('nothing to play')
+    end = max(s + min(h, 6.0) + 0.3 for s, _, _, h in events)
+    left, right = np.zeros(int(end * RATE) + 1), np.zeros(int(end * RATE) + 1)
+    for start, note, vel, held in events:
+        s = piano(note, vel, held)
+        i = int(start * RATE)
+        pan = np.clip((note - 60) / 48, -0.5, 0.5)   # low notes left, high notes right
+        left[i:i + len(s)] += s * (0.5 - pan / 2)
+        right[i:i + len(s)] += s * (0.5 + pan / 2)
+    peak = max(np.abs(left).max(), np.abs(right).max()) or 1
+    stereo = np.stack([left, right], axis=1) / peak * 0.9 * 32767
+    return stereo.astype('<i2').tobytes()
+
+
+# --- input: note strings ---------------------------------------------------------
+
+def parse_voice(text, beat):
+    """'E5 G5:2 C3+E3+G3:4 -' -> events. ':n' = beats, '+' = chord, '-' = rest."""
+    events, t = [], 0.0
+    for tok in text.split():
+        name, _, beats = tok.partition(':')
+        dur = float(beats or 1) * beat
+        if name not in ('-', 'r'):
+            for n in name.split('+'):
+                events.append((t, note_number(n), 100, dur))
+        t += dur
+    return events
+
+
+# --- input: MIDI files -----------------------------------------------------------
+
+def varlen(data, i):
+    """MIDI variable-length number: 7 bits per byte, top bit = 'more bytes follow'."""
+    value = 0
+    while True:
+        b = data[i]; i += 1
+        value = (value << 7) | (b & 0x7F)
+        if not b & 0x80:
+            return value, i
+
+
+def read_midi(path):
+    """-> (raw events sorted by tick, ticks per beat)."""
+    data = open(path, 'rb').read()
+    if data[:4] != b'MThd':
+        sys.exit('not a MIDI file')
+    _, ntracks, division = struct.unpack('>HHH', data[8:14])
+    if division & 0x8000:
+        sys.exit('SMPTE timing not supported')
+    i, raw = 8 + struct.unpack('>I', data[4:8])[0], []      # raw: (tick, kind, ...)
+    for _ in range(ntracks):
+        assert data[i:i + 4] == b'MTrk'
+        end = i + 8 + struct.unpack('>I', data[i + 4:i + 8])[0]
+        i += 8; tick = 0; status = 0
+        while i < end:
+            delta, i = varlen(data, i); tick += delta
+            if data[i] & 0x80:
+                status = data[i]; i += 1                     # else: running status
+            kind = status & 0xF0
+            if status == 0xFF:                               # meta event
+                mtype = data[i]; length, i = varlen(data, i + 1)
+                if mtype == 0x51:                            # tempo: µs per quarter note
+                    raw.append((tick, 'tempo', int.from_bytes(data[i:i + 3], 'big')))
+                i += length
+            elif status in (0xF0, 0xF7):                     # sysex: skip
+                length, i = varlen(data, i); i += length
+            elif kind in (0xC0, 0xD0):                       # program change / pressure
+                i += 1
+            else:
+                a, b = data[i], data[i + 1]; i += 2
+                ch = status & 0x0F
+                if ch == 9:                                  # channel 10 = drums, skip for piano
+                    continue
+                if kind == 0x90 and b > 0:
+                    raw.append((tick, 'on', ch, a, b))
+                elif kind == 0x80 or kind == 0x90:
+                    raw.append((tick, 'off', ch, a))
+                elif kind == 0xB0 and a == 64:               # sustain pedal
+                    raw.append((tick, 'pedal', ch, b >= 64))
+        i = end
+    raw.sort(key=lambda e: (e[0], e[1] != 'tempo', e[1] == 'on'))
+    return raw, division
+
+
+def parse_midi(path):
+    raw, division = read_midi(path)
+
+    # ticks -> seconds through the tempo map, pair note-ons with note-offs
+    events, sounding, sustained, pedal = [], {}, {}, {}
+    sec, last_tick, tempo = 0.0, 0, 500000
+    def finish(key, when):
+        start, vel = sounding.pop(key)
+        events.append((start, key[1], vel, max(when - start, 0.05)))
+    for e in raw:
+        sec += (e[0] - last_tick) * tempo / 1e6 / division; last_tick = e[0]
+        if e[1] == 'tempo':
+            tempo = e[2]
+        elif e[1] == 'on':
+            key = (e[2], e[3])
+            if key in sounding:
+                finish(key, sec)
+            sustained.pop(key, None)
+            sounding[key] = (sec, e[4])
+        elif e[1] == 'off':
+            key = (e[2], e[3])
+            if key in sounding:
+                if pedal.get(e[2]):
+                    sustained[key] = True                    # pedal holds it on
+                else:
+                    finish(key, sec)
+        elif e[1] == 'pedal':
+            pedal[e[2]] = e[3]
+            if not e[3]:
+                for key in [k for k in sustained if k[0] == e[2]]:
+                    del sustained[key]
+                    if key in sounding:
+                        finish(key, sec)
+    for key in list(sounding):
+        finish(key, sec)
+    return events
+
+
+def note_name(n):
+    return ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B'][n % 12] + str(n // 12 - 1)
+
+
+def beats_str(b):
+    return '' if b == 1 else f':{b:g}'
+
+
+def midi_to_notes(path, grid=4):
+    """Translate a MIDI file into a `notes` command: quantize to 1/grid beat,
+    group simultaneous notes into chords, spread overlaps across voices."""
+    raw, division = read_midi(path)
+    q = lambda tick: round(tick * grid / division)          # ticks -> grid steps
+
+    # pair note-ons with note-offs, in grid steps
+    notes, sounding, tempos = [], {}, []
+    for e in raw:
+        if e[1] == 'tempo':
+            tempos.append((e[0], e[2]))
+        elif e[1] == 'on':
+            sounding[(e[2], e[3])] = e[0]
+        elif e[1] == 'off' and (e[2], e[3]) in sounding:
+            start = q(sounding.pop((e[2], e[3])))
+            notes.append((start, max(q(e[0]) - start, 1), e[3]))
+
+    # same start + same length = one chord
+    chords = {}
+    for start, dur, pitch in notes:
+        chords.setdefault((start, dur), []).append(pitch)
+    # highest notes first, so the melody lands in voice 1
+    order = sorted(chords.items(), key=lambda c: (c[0][0], -max(c[1])))
+
+    voices = []                                              # each: [end_step, tokens]
+    for (start, dur), pitches in order:
+        voice = next((v for v in voices if v[0] <= start), None)
+        if voice is None:
+            voice = [0, []]; voices.append(voice)
+        if start > voice[0]:
+            voice[1].append('-' + beats_str((start - voice[0]) / grid))
+        voice[1].append('+'.join(note_name(p) for p in sorted(pitches)) + beats_str(dur / grid))
+        voice[0] = start + dur
+
+    # one fixed tempo: the tempo in effect for most of the piece
+    weight = {}
+    ends = [t for t, _ in tempos[1:]] + [raw[-1][0]]
+    for (t, us), end in zip(tempos or [(0, 500000)], ends):
+        weight[us] = weight.get(us, 0) + end - t
+    beat = max(weight, key=weight.get) / 1e6 if weight else 0.5
+    return beat, [' '.join(tokens) for _, tokens in voices]
+
+
+PLAYERS = [['pw-play'], ['afplay'], ['paplay'], ['aplay', '-q'],      # PipeWire, macOS, Pulse, ALSA
+           ['ffplay', '-nodisp', '-autoexit', '-loglevel', 'quiet']]
+
+
+def play(path):
+    """Play a .wav with whatever this system has."""
+    if sys.platform == 'win32':
+        import winsound
+        return winsound.PlaySound(path, winsound.SND_FILENAME)
+    for cmd in PLAYERS:
+        if shutil.which(cmd[0]):
+            return subprocess.run(cmd + [path])
+    sys.exit('no audio player found (tried pw-play, afplay, paplay, aplay, ffplay); use -o file.wav')
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument('voices', nargs='*', help='note strings, one per voice')
+    ap.add_argument('--midi', help='render this .mid file instead')
+    ap.add_argument('-b', '--beat', type=float, default=0.4, help='seconds per beat (default 0.4)')
+    ap.add_argument('-o', '--out', help='write a .wav instead of playing it')
+    ap.add_argument('--to-notes', action='store_true', help='with --midi: print it as a notes command')
+    args = ap.parse_args()
+
+    if args.midi and args.to_notes:
+        beat, voices = midi_to_notes(args.midi)
+        print(f'notes -b {beat:.3f} \\\n  ' + ' \\\n  '.join(f'"{v}"' for v in voices))
+        return
+    if args.midi:
+        events = parse_midi(args.midi)
+    else:
+        events = [e for v in args.voices for e in parse_voice(v, args.beat)]
+    pcm = render(events)
+
+    out = args.out or tempfile.mktemp(suffix='.wav')
+    with wave.open(out, 'wb') as w:
+        w.setnchannels(2); w.setsampwidth(2); w.setframerate(RATE)
+        w.writeframes(pcm)
+    print(f'{len(events)} notes, {len(pcm) / 4 / RATE:.1f} s', file=sys.stderr)
+    if not args.out:
+        try:
+            play(out)
+        finally:
+            os.unlink(out)
+
+
+if __name__ == '__main__':
+    main()
